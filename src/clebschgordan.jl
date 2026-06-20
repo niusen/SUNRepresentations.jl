@@ -395,30 +395,44 @@ function highest_weight_nullspace_matrixfree_uncached(
         T::Type{<:Real}, s1::I, s2::I, s3::I;
         tol::Real = 1.0e-10,
         maxiter::Int = 300,
-        krylovdim::Int = 50
+        krylovdim::Int = 50,
+        restarts::Int = 1
     ) where {I <: SUNIrrep}
     op = highest_weight_operator(T, s1, s2, s3)
     r = directproduct(s1, s2)[s3]
     r > 0 || throw(ArgumentError("channel $s1 x $s2 -> $s3 has zero multiplicity"))
+    restarts >= 1 || throw(ArgumentError("restarts must be positive"))
 
-    x0 = randn(T, op.K)
-    vals, vecs, info = KrylovKit.eigsolve(
-        x -> mul_AtA(op, x), x0, r, :SR;
-        tol = tol, maxiter = maxiter, krylovdim = max(krylovdim, 2r + 10)
-    )
+    best = nothing
+    for attempt in 1:restarts
+        x0 = randn(T, op.K)
+        vals, vecs, info = KrylovKit.eigsolve(
+            x -> mul_AtA(op, x), x0, r, :SR;
+            tol = tol, maxiter = maxiter, krylovdim = max(krylovdim, 2r + 10)
+        )
 
-    Q = _orthonormalize_columns(reduce(hcat, vecs))
-    AQ = mul_A(op, Q)
-    residual = norm(AQ) / max(norm(Q), eps(float(one(T))))
-    ortherr = norm(Q' * Q - Matrix{T}(LinearAlgebra.I, size(Q, 2), size(Q, 2)))
+        Q = _orthonormalize_columns(reduce(hcat, vecs))
+        AQ = mul_A(op, Q)
+        residual = norm(AQ) / max(norm(Q), eps(float(one(T))))
+        ortherr = norm(Q' * Q - Matrix{T}(LinearAlgebra.I, size(Q, 2), size(Q, 2)))
+        candidate = (; basis = Q, eigenvalues = vals, info, residual, ortherr, attempt)
+        best = isnothing(best) || candidate.residual < best.residual ? candidate : best
+
+        if _profile_cgc_enabled()
+            @info "matrix-free highest-weight attempt" s1 s2 s3 attempt restarts residual ortherr eigenvalues = vals info
+        end
+        residual <= tol && break
+    end
 
     return (;
-        basis = Q,
+        basis = best.basis,
         op,
-        eigenvalues = vals,
-        info,
-        residual,
-        ortherr,
+        eigenvalues = best.eigenvalues,
+        info = best.info,
+        residual = best.residual,
+        ortherr = best.ortherr,
+        attempt = best.attempt,
+        restarts,
         dense_memory_gib = _dense_memory_gib(T, op.M, op.K),
         M = op.M,
         K = op.K,
