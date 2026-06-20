@@ -39,7 +39,7 @@ end
 function _cgc_use_matrixfree(mode::Symbol, ::Type{T}, m, n) where {T}
     mode === :off && return false
     mode === :on && return true
-    threshold = _profile_float_env("SUNREP_CGC_MATRIXFREE_MIN_GIB", 5.0)
+    threshold = _profile_float_env("SUNREP_CGC_MATRIXFREE_MIN_GIB", 0.5)
     return _dense_memory_gib(T, m, n) >= threshold
 end
 
@@ -67,11 +67,14 @@ function _profile_cgc_large_lowering(::Type{T}, imax, jmax, qr_time) where {T}
 end
 
 function _profile_record_current_cgc(stage, s1, s2, s3; kwargs...)
-    !_profile_cgc_enabled() && return nothing
-
-    @info "CGC current channel" stage s1 s2 s3 extra = collect(kwargs)
-
+    profile_enabled = _profile_cgc_enabled()
     path = get(ENV, "SUNREP_CURRENT_CGC_FILE", "")
+    !profile_enabled && isempty(path) && return nothing
+
+    if profile_enabled
+        @info "CGC current channel" stage s1 s2 s3 extra = collect(kwargs)
+    end
+
     isempty(path) && return nothing
 
     try
