@@ -25,6 +25,7 @@ end
 _profile_seconds(t0::UInt64) = 1.0e-9 * (time_ns() - t0)
 _dense_memory_gib(::Type{T}, m, n) where {T} = sizeof(T) * Float64(m) * Float64(n) / 1024.0^3
 _dense_memory_mib(::Type{T}, m, n) where {T} = sizeof(T) * Float64(m) * Float64(n) / 1024.0^2
+_eigenvalue_sigma(value) = sqrt(abs(value))
 
 function _profile_cgc_large_channel(N, m, n)
     !_profile_cgc_enabled() && return false
@@ -391,6 +392,20 @@ function _orthonormalize_columns(X::AbstractMatrix)
     return Matrix(F.Q)[:, 1:size(X, 2)]
 end
 
+function _lowest_eigenvectors(vals, vecs, r::Int, ::Type{T}) where {T <: Real}
+    order = sortperm(collect(eachindex(vals)); by = i -> abs(vals[i]))
+    selected = reduce(hcat, vecs[order[1:r]])
+    discarded = r < length(order) ? vals[order[(r + 1):end]] : vals[1:0]
+    if eltype(selected) <: Complex
+        imag_norm = norm(imag.(selected))
+        real_norm = max(norm(real.(selected)), eps(float(one(T))))
+        imag_norm / real_norm <= 100 * eps(float(one(T))) ||
+            throw(ArgumentError("matrix-free nullspace returned complex vectors with relative imaginary norm $(imag_norm / real_norm)"))
+        selected = real.(selected)
+    end
+    return convert(Matrix{T}, selected), vals[order[1:r]], discarded
+end
+
 function highest_weight_nullspace_matrixfree_uncached(
         T::Type{<:Real}, s1::I, s2::I, s3::I;
         tol::Real = 1.0e-10,
@@ -411,15 +426,31 @@ function highest_weight_nullspace_matrixfree_uncached(
             tol = tol, maxiter = maxiter, krylovdim = max(krylovdim, 2r + 10)
         )
 
-        Q = _orthonormalize_columns(reduce(hcat, vecs))
+        X, selected_vals, discarded_vals = _lowest_eigenvectors(vals, vecs, r, T)
+        Q = _orthonormalize_columns(X)
         AQ = mul_A(op, Q)
         residual = norm(AQ) / max(norm(Q), eps(float(one(T))))
         ortherr = norm(Q' * Q - Matrix{T}(LinearAlgebra.I, size(Q, 2), size(Q, 2)))
-        candidate = (; basis = Q, eigenvalues = vals, info, residual, ortherr, attempt)
+        selected_sigmas = _eigenvalue_sigma.(selected_vals)
+        discarded_sigmas = _eigenvalue_sigma.(discarded_vals)
+        raw_sigmas = _eigenvalue_sigma.(vals)
+        candidate = (;
+            basis = Q,
+            eigenvalues = selected_vals,
+            discarded_eigenvalues = discarded_vals,
+            raw_eigenvalues = vals,
+            sigmas = selected_sigmas,
+            discarded_sigmas,
+            raw_sigmas,
+            info,
+            residual,
+            ortherr,
+            attempt,
+        )
         best = isnothing(best) || candidate.residual < best.residual ? candidate : best
 
         if _profile_cgc_enabled()
-            @info "matrix-free highest-weight attempt" s1 s2 s3 attempt restarts residual ortherr eigenvalues = vals info
+            @info "matrix-free highest-weight attempt" s1 s2 s3 attempt restarts residual ortherr sigmas = selected_sigmas discarded_sigmas raw_sigmas eigenvalues = selected_vals discarded_eigenvalues = discarded_vals raw_eigenvalues = vals info
         end
         residual <= tol && break
     end
@@ -428,6 +459,11 @@ function highest_weight_nullspace_matrixfree_uncached(
         basis = best.basis,
         op,
         eigenvalues = best.eigenvalues,
+        discarded_eigenvalues = best.discarded_eigenvalues,
+        raw_eigenvalues = best.raw_eigenvalues,
+        sigmas = best.sigmas,
+        discarded_sigmas = best.discarded_sigmas,
+        raw_sigmas = best.raw_sigmas,
         info = best.info,
         residual = best.residual,
         ortherr = best.ortherr,
