@@ -5,6 +5,41 @@ const TOL_GAUGE = 1.0e-11
 const TOL_PURGE = 1.0e-14
 # tolerance for dropping zeros
 
+_envflag(name) = lowercase(get(ENV, name, "")) in ("1", "true", "yes", "on")
+_profile_cgc_enabled() = _envflag("SUNREP_PROFILE_CGC")
+
+function _profile_float_env(name, default)
+    value = get(ENV, name, "")
+    isempty(value) && return default
+    parsed = tryparse(Float64, value)
+    return isnothing(parsed) ? default : parsed
+end
+
+function _profile_int_env(name, default)
+    value = get(ENV, name, "")
+    isempty(value) && return default
+    parsed = tryparse(Int, value)
+    return isnothing(parsed) ? default : parsed
+end
+
+_profile_seconds(t0::UInt64) = 1.0e-9 * (time_ns() - t0)
+_dense_memory_gib(::Type{T}, m, n) where {T} = sizeof(T) * Float64(m) * Float64(n) / 1024.0^3
+_dense_memory_mib(::Type{T}, m, n) where {T} = sizeof(T) * Float64(m) * Float64(n) / 1024.0^2
+
+function _profile_cgc_large_channel(N, m, n)
+    !_profile_cgc_enabled() && return false
+    threshold = _profile_float_env("SUNREP_PROFILE_CGC_MK_THRESHOLD", 1.0e7)
+    minN = _profile_int_env("SUNREP_PROFILE_CGC_MIN_N", 5)
+    return N >= minN || Float64(m) * Float64(n) >= threshold
+end
+
+function _profile_cgc_large_lowering(::Type{T}, imax, jmax, qr_time) where {T}
+    !_profile_cgc_enabled() && return false
+    dense_mb = _dense_memory_mib(T, imax, jmax)
+    threshold = _profile_float_env("SUNREP_PROFILE_CGC_MK_THRESHOLD", 1.0e7)
+    return dense_mb >= 100 || Float64(imax) * Float64(jmax) >= threshold || qr_time >= 1.0
+end
+
 function weightmap(basis)
     N = first(basis).N
     # basis could be a GTPatternIterator{N}, but also a Vector{GTPattern{N}}
@@ -22,12 +57,42 @@ function CGC(::Type{T}, s1::SUNIrrep{N}, s2::SUNIrrep{N}, s3::SUNIrrep{N}) where
 end
 
 @noinline function _get_CGC(::Type{T}, @nospecialize(key)) where {T}
-    d::SparseArray{T, 4} = get!(CGC_CACHE, key) do
-        result = tryread(T, key...)
-        isnothing(result) || return result
-        return generate_CGC(T, key...)
+    s1, s2, s3 = key
+    N = s1.N
+    disable_ram_cache = _envflag("SUNREP_DISABLE_RAM_CACHE")
+
+    if !disable_ram_cache && haskey(CGC_CACHE, key)
+        load_start = time_ns()
+        d::SparseArray{T, 4} = CGC_CACHE[key]
+        _profile_cgc_enabled() &&
+            @info "CGC cache lookup" s1 s2 s3 N T cache_hit = true source = :ram_cache load_time = _profile_seconds(load_start)
+        return d
     end
-    return d
+
+    _profile_cgc_enabled() &&
+        @info "CGC cache lookup" s1 s2 s3 N T cache_hit = false source = :ram_cache disabled = disable_ram_cache
+
+    load_start = time_ns()
+    result = tryread(T, key...)
+    load_time = _profile_seconds(load_start)
+    if !isnothing(result)
+        if !disable_ram_cache
+            CGC_CACHE[key] = result
+        end
+        _profile_cgc_enabled() &&
+            @info "CGC cache lookup" s1 s2 s3 N T cache_hit = true source = :disk_cache load_time
+        return result::SparseArray{T, 4}
+    end
+
+    generate_start = time_ns()
+    result = generate_CGC(T, key...)
+    generation_time = _profile_seconds(generate_start)
+    if !disable_ram_cache
+        CGC_CACHE[key] = result
+    end
+    _profile_cgc_enabled() &&
+        @info "CGC cache lookup" s1 s2 s3 N T cache_hit = false source = :generated generation_time ram_cache_write = !disable_ram_cache
+    return result::SparseArray{T, 4}
 end
 
 function _CGC(T::Type{<:Real}, s1::I, s2::I, s3::I) where {I <: SUNIrrep}
@@ -68,6 +133,7 @@ end
 const _emptyindexlist = Vector{Int}()
 
 function highest_weight_CGC(T::Type{<:Real}, s1::I, s2::I, s3::I) where {I <: SUNIrrep}
+    build_start = time_ns()
     d1, d2, d3 = dim(s1), dim(s2), dim(s3)
     N = s1.N
 
@@ -102,18 +168,39 @@ function highest_weight_CGC(T::Type{<:Real}, s1::I, s2::I, s3::I) where {I <: SU
         end
     end
     rows = unique!(sort!(rows))
-    reduced_eqs = convert(Array, eqs[rows, cols])
+    M = length(rows)
+    K = length(cols)
+    build_time = _profile_seconds(build_start)
+    should_log = _profile_cgc_large_channel(N, M, K)
+    if should_log
+        @info "highest_weight_CGC equation" s1 s2 s3 N T d1 d2 d3 M K dense_memory_gib = _dense_memory_gib(T, M, K) build_time
+    end
+
+    slice_start = time_ns()
+    sliced_eqs = eqs[rows, cols]
+    slice_time = _profile_seconds(slice_start)
+
+    convert_start = time_ns()
+    reduced_eqs = convert(Array, sliced_eqs)
+    convert_time = _profile_seconds(convert_start)
+
+    nullspace_start = time_ns()
     solutions = try
         _nullspace!(reduced_eqs; atol = TOL_NULLSPACE)
     catch err
         err isa LAPACKException || rethrow(err)
         # try again with more stable algorithm
         @warn "LAPACK SDD failed, retrying with SVD" exception = err
-        reduced_eqs = convert(Array, eqs[rows, cols])
+        reduced_eqs = convert(Array, sliced_eqs)
         _nullspace!(reduced_eqs; atol = TOL_NULLSPACE, alg = LinearAlgebra.QRIteration())
     end
+    nullspace_time = _profile_seconds(nullspace_start)
 
     N123 = size(solutions, 2)
+
+    if should_log
+        @info "highest_weight_CGC solved" s1 s2 s3 N T M K nullity = N123 slice_time convert_time nullspace_time total_time = _profile_seconds(build_start)
+    end
 
     @assert N123 == directproduct(s1, s2)[s3]
 
@@ -220,7 +307,12 @@ function lower_weight_CGC!(CGC, s1::I, s2::I, s3::I) where {I <: SUNIrrep{N}} wh
             end
 
             # solve equations
+            qr_start = time_ns()
             sols = ldiv!(qr!(eqs), rhs)
+            qr_time = _profile_seconds(qr_start)
+            if _profile_cgc_large_lowering(T, imax, jmax, qr_time)
+                @info "lower_weight_CGC dense QR" s1 s2 s3 T alpha = α w3 imax jmax rhscols = length(mask) dense_memory_mib = _dense_memory_mib(T, imax, jmax) qr_time
+            end
 
             # fill in CGC
             # loop over sols in column major order, CGC is hashmap anyways
@@ -302,9 +394,19 @@ function _nullspace!(
     )
     m, n = size(A)
     (m == 0 || n == 0) && return Matrix{eltype(A)}(I, n, n)
+    svd_start = time_ns()
     SVD = svd!(A; full = true, alg)
+    svd_time = _profile_seconds(svd_start)
     tol = max(atol, SVD.S[1] * rtol)
     indstart = sum(s -> s .> tol, SVD.S) + 1
+    if _profile_cgc_enabled()
+        svals = SVD.S
+        tail_start = max(firstindex(svals), lastindex(svals) - 9)
+        tail = isempty(svals) ? eltype(svals)[] : collect(view(svals, tail_start:lastindex(svals)))
+        largest = isempty(svals) ? NaN : first(svals)
+        nullity = max(0, size(SVD.Vt, 1) - indstart + 1)
+        @info "_nullspace! dense SVD" size = (m, n) dense_memory_gib = _dense_memory_gib(eltype(A), m, n) svd_time atol rtol tol nullity small_singular_values = tail largest_singular_value = largest
+    end
     return copy(SVD.Vt[indstart:end, :]')
 end
 

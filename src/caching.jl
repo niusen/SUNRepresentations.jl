@@ -8,23 +8,42 @@ const CGC_CACHE = LRU{Any, SparseArray{Float64, 4}}(; maxsize = 100_000)
 # convert sector to string key
 _key(s::SUNIrrep) = string(weight(s))
 
-const CGC_CACHE_PATH = @get_scratch!("CGC")
+function _cgc_cache_path()
+    path = get(ENV, "SUNREP_CGC_CACHE_DIR", get(ENV, "SUNREP_TEST_CACHE_DIR", ""))
+    if isempty(path)
+        return mktempdir(; prefix = "sunrep_cgc_cache_")
+    end
+    return mkpath(path)
+end
+
+const CGC_CACHE_PATH = _cgc_cache_path()
 function cgc_cachepath(s1::SUNIrrep{N}, s2::SUNIrrep{N}, T = Float64) where {N}
     return joinpath(CGC_CACHE_PATH, string(N), string(T), _key(s1), _key(s2))
 end
 
 function tryread(::Type{T}, s1::SUNIrrep{N}, s2::SUNIrrep{N}, s3::SUNIrrep{N}) where {T, N}
     fn = cgc_cachepath(s1, s2, T)
-    isfile(fn * ".jld2") || return nothing
+    if !isfile(fn * ".jld2")
+        _profile_cgc_enabled() &&
+            @info "CGC disk cache miss: cache file absent" s1 s2 s3 N T path = fn * ".jld2"
+        return nothing
+    end
 
     return mkpidlock(fn * ".pid"; stale_age = _PID_STALE_AGE) do
         try
             return jldopen(fn * ".jld2", "r"; parallel_read = true) do file
                 @debug "loaded CGC from disk: $s1 ⊗ $s2 → $s3"
-                !haskey(file, _key(s3)) && return nothing
+                if !haskey(file, _key(s3))
+                    _profile_cgc_enabled() &&
+                        @info "CGC disk cache miss: channel absent" s1 s2 s3 N T path = fn * ".jld2"
+                    return nothing
+                end
                 return file[_key(s3)]::SparseArray{T, 4}
             end
         catch
+            _profile_cgc_enabled() &&
+                @info "CGC disk cache miss: read failed" s1 s2 s3 N T path = fn * ".jld2"
+            return nothing
         end
     end
 
@@ -53,18 +72,25 @@ function generate_CGC(
         s3::SUNIrrep{N}
     ) where {T, N}
     @debug "Generating CGCs: $s1 ⊗ $s2"
+    compute_start = time_ns()
     CGCs = _CGC(T, s1, s2, s3)
+    compute_time = _profile_seconds(compute_start)
     fn = cgc_cachepath(s1, s2, T)
     isdir(dirname(fn)) || mkpath(dirname(fn))
 
     ks3 = _key(s3)
+    write_start = time_ns()
+    wrote_cache = false
     mkpidlock(fn * ".pid"; stale_age = _PID_STALE_AGE) do
         return jldopen(fn * ".jld2", "a+") do file
             if !haskey(file, ks3)
                 file[ks3] = CGCs
+                wrote_cache = true
             end
         end
     end
+    _profile_cgc_enabled() &&
+        @info "CGC generated" s1 s2 s3 N T compute_time write_time = _profile_seconds(write_start) wrote_cache
     return CGCs
 end
 
@@ -113,7 +139,11 @@ function clear_disk_cache!(N)
     return nothing
 end
 function clear_disk_cache!()
-    Scratch.clear_scratchspaces!(SUNRepresentations)
+    if isdir(CGC_CACHE_PATH)
+        @info "Removing current CGC disk cache" path = CGC_CACHE_PATH
+        rm(CGC_CACHE_PATH; recursive = true)
+        mkpath(CGC_CACHE_PATH)
+    end
     return nothing
 end
 
