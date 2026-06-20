@@ -39,7 +39,7 @@ end
 function _cgc_use_matrixfree(mode::Symbol, ::Type{T}, m, n) where {T}
     mode === :off && return false
     mode === :on && return true
-    threshold = _profile_float_env("SUNREP_CGC_MATRIXFREE_MIN_GIB", 0.5)
+    threshold = _profile_float_env("SUNREP_CGC_MATRIXFREE_MIN_GIB", 5.0)
     return _dense_memory_gib(T, m, n) >= threshold
 end
 
