@@ -132,9 +132,27 @@ function _CGC(T::Type{<:Real}, s1::I, s2::I, s3::I) where {I <: SUNIrrep}
         @assert s1 == s3
         CGC = trivial_CGC(T, s1, false)
     else
-        CGC = highest_weight_CGC(T, s1, s2, s3)
-        lower_weight_CGC!(CGC, s1, s2, s3)
-        purge!(CGC)
+        if _profile_cgc_enabled()
+            _profile_record_current_cgc(:CGC_highest_weight_started, s1, s2, s3; T)
+            hw = @timed highest_weight_CGC(T, s1, s2, s3)
+            CGC = hw.value
+            @info "CGC step finished" step = :highest_weight s1 s2 s3 T time = hw.time allocated_bytes = hw.bytes gc_time = hw.gctime nnz = length(CGC.data)
+            _profile_record_current_cgc(:CGC_highest_weight_finished, s1, s2, s3; T, time = hw.time, allocated_bytes = hw.bytes, gc_time = hw.gctime, nnz = length(CGC.data))
+
+            _profile_record_current_cgc(:CGC_lowering_started, s1, s2, s3; T, nnz = length(CGC.data))
+            lowering = @timed lower_weight_CGC!(CGC, s1, s2, s3)
+            @info "CGC step finished" step = :lowering s1 s2 s3 T time = lowering.time allocated_bytes = lowering.bytes gc_time = lowering.gctime nnz = length(CGC.data)
+            _profile_record_current_cgc(:CGC_lowering_finished, s1, s2, s3; T, time = lowering.time, allocated_bytes = lowering.bytes, gc_time = lowering.gctime, nnz = length(CGC.data))
+
+            _profile_record_current_cgc(:CGC_purge_started, s1, s2, s3; T, nnz = length(CGC.data))
+            purged = @timed purge!(CGC)
+            @info "CGC step finished" step = :purge s1 s2 s3 T time = purged.time allocated_bytes = purged.bytes gc_time = purged.gctime nnz = length(CGC.data)
+            _profile_record_current_cgc(:CGC_purge_finished, s1, s2, s3; T, time = purged.time, allocated_bytes = purged.bytes, gc_time = purged.gctime, nnz = length(CGC.data))
+        else
+            CGC = highest_weight_CGC(T, s1, s2, s3)
+            lower_weight_CGC!(CGC, s1, s2, s3)
+            purge!(CGC)
+        end
     end
     @debug "Computed CGC: $s1 ⊗ $s2 → $s3"
     return CGC
@@ -497,6 +515,15 @@ function lower_weight_CGC!(CGC, s1::I, s2::I, s3::I) where {I <: SUNIrrep{N}} wh
     rhs_rows = Int[]
     rhs_cols = CartesianIndex{2}[]
     rhs_vals = T[]
+    profile_lowering = _profile_cgc_enabled()
+    lowering_start = time_ns()
+    lowering_blocks = 0
+    lowering_total_qr_time = 0.0
+    lowering_max_qr_time = 0.0
+    lowering_max_imax = 0
+    lowering_max_jmax = 0
+    lowering_max_rhscols = 0
+    lowering_total_dense_entries = 0
 
     # @threads for α = 1:N123 # TODO: consider multithreaded implementation
     for α in 1:N123
@@ -507,6 +534,9 @@ function lower_weight_CGC!(CGC, s1::I, s2::I, s3::I) where {I <: SUNIrrep{N}} wh
                 w3′ = Base.setindex(w3, w3[l] + 1, l)
                 w3′ = Base.setindex(w3′, w3[l + 1] - 1, l + 1)
                 return length(get(map3, w3′, _emptyindexlist))
+            end
+            if profile_lowering
+                _profile_record_current_cgc(:CGC_lowering_block_started, s1, s2, s3; T, w3, imax, jmax)
             end
             eqs = Array{T}(undef, (imax, jmax))
 
@@ -569,6 +599,17 @@ function lower_weight_CGC!(CGC, s1::I, s2::I, s3::I) where {I <: SUNIrrep{N}} wh
             qr_start = time_ns()
             sols = ldiv!(qr!(eqs), rhs)
             qr_time = _profile_seconds(qr_start)
+            if profile_lowering
+                lowering_blocks += 1
+                lowering_total_qr_time += qr_time
+                lowering_total_dense_entries += imax * jmax
+                if qr_time > lowering_max_qr_time
+                    lowering_max_qr_time = qr_time
+                    lowering_max_imax = imax
+                    lowering_max_jmax = jmax
+                    lowering_max_rhscols = length(mask)
+                end
+            end
             if _profile_cgc_large_lowering(T, imax, jmax, qr_time)
                 @info "lower_weight_CGC dense QR" s1 s2 s3 T alpha = α w3 imax jmax rhscols = length(mask) dense_memory_mib = _dense_memory_mib(T, imax, jmax) qr_time
             end
@@ -581,6 +622,9 @@ function lower_weight_CGC!(CGC, s1::I, s2::I, s3::I) where {I <: SUNIrrep{N}} wh
                 end
             end
         end
+    end
+    if profile_lowering
+        @info "lower_weight_CGC summary" s1 s2 s3 T multiplicity = N123 blocks = lowering_blocks total_time = _profile_seconds(lowering_start) total_qr_time = lowering_total_qr_time max_qr_time = lowering_max_qr_time max_imax = lowering_max_imax max_jmax = lowering_max_jmax max_rhscols = lowering_max_rhscols max_dense_memory_mib = _dense_memory_mib(T, lowering_max_imax, lowering_max_jmax) total_dense_entries = lowering_total_dense_entries
     end
     return CGC
 end
