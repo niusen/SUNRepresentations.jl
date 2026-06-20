@@ -54,6 +54,9 @@ function _profile_record_current_cgc(stage, s1, s2, s3; kwargs...)
             println(io, "s1 = ", repr(s1))
             println(io, "s2 = ", repr(s2))
             println(io, "s3 = ", repr(s3))
+            println(io, "SUNREP_BENCH_S1 = ", dimname(s1))
+            println(io, "SUNREP_BENCH_S2 = ", dimname(s2))
+            println(io, "SUNREP_BENCH_S3 = ", dimname(s3))
             for (key, value) in kwargs
                 println(io, key, " = ", value)
             end
