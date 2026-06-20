@@ -27,6 +27,31 @@ _dense_memory_gib(::Type{T}, m, n) where {T} = sizeof(T) * Float64(m) * Float64(
 _dense_memory_mib(::Type{T}, m, n) where {T} = sizeof(T) * Float64(m) * Float64(n) / 1024.0^2
 _eigenvalue_sigma(value) = sqrt(abs(value))
 
+function _cgc_matrixfree_mode()
+    value = lowercase(get(ENV, "SUNREP_CGC_MATRIXFREE", "off"))
+    value in ("0", "false", "no", "off", "dense") && return :off
+    value in ("1", "true", "yes", "on", "matrixfree") && return :on
+    value == "auto" && return :auto
+    @warn "Unknown SUNREP_CGC_MATRIXFREE value; using dense CGC nullspace" value
+    return :off
+end
+
+function _cgc_use_matrixfree(mode::Symbol, ::Type{T}, m, n) where {T}
+    mode === :off && return false
+    mode === :on && return true
+    threshold = _profile_float_env("SUNREP_CGC_MATRIXFREE_MIN_GIB", 0.5)
+    return _dense_memory_gib(T, m, n) >= threshold
+end
+
+function _cgc_matrixfree_options()
+    return (;
+        tol = _profile_float_env("SUNREP_CGC_MATRIXFREE_TOL", 1.0e-13),
+        maxiter = _profile_int_env("SUNREP_CGC_MATRIXFREE_MAXITER", 1000),
+        krylovdim = _profile_int_env("SUNREP_CGC_MATRIXFREE_KRYLOVDIM", 120),
+        restarts = _profile_int_env("SUNREP_CGC_MATRIXFREE_RESTARTS", 3),
+    )
+end
+
 function _profile_cgc_large_channel(N, m, n)
     !_profile_cgc_enabled() && return false
     threshold = _profile_float_env("SUNREP_PROFILE_CGC_MK_THRESHOLD", 1.0e7)
@@ -184,6 +209,100 @@ function highest_weight_CGC(T::Type{<:Real}, s1::I, s2::I, s3::I) where {I <: SU
     d1, d2, d3 = dim(s1), dim(s2), dim(s3)
     N = s1.N
     _profile_record_current_cgc(:highest_weight_CGC_started, s1, s2, s3; N, T, d1, d2, d3)
+
+    matrixfree_mode = _cgc_matrixfree_mode()
+    if matrixfree_mode !== :off
+        op_start = time_ns()
+        op = highest_weight_operator(T, s1, s2, s3)
+        M = op.M
+        K = op.K
+        build_time = _profile_seconds(op_start)
+        use_matrixfree = _cgc_use_matrixfree(matrixfree_mode, T, M, K)
+        method = use_matrixfree ? :matrixfree : :dense
+        should_log = _profile_cgc_large_channel(N, M, K)
+        if should_log
+            @info "highest_weight_CGC equation" s1 s2 s3 N T d1 d2 d3 M K method matrixfree_mode dense_memory_gib = _dense_memory_gib(T, M, K) build_time
+        end
+        _profile_record_current_cgc(
+            :highest_weight_CGC_equation_built, s1, s2, s3;
+            N, T, d1, d2, d3, M, K, method, matrixfree_mode,
+            dense_memory_gib = _dense_memory_gib(T, M, K),
+            build_time
+        )
+
+        slice_time = 0.0
+        convert_time = 0.0
+        nullspace_start = time_ns()
+        matrixfree_result = nothing
+        matrixfree_time = missing
+        solutions = if use_matrixfree
+            opts = _cgc_matrixfree_options()
+            matrixfree_result_ref = Ref{Any}()
+            matrixfree_time = @elapsed begin
+                matrixfree_result_ref[] = _highest_weight_nullspace_matrixfree(
+                    T, op;
+                    tol = opts.tol,
+                    maxiter = opts.maxiter,
+                    krylovdim = opts.krylovdim,
+                    restarts = opts.restarts,
+                )
+            end
+            matrixfree_result = matrixfree_result_ref[]
+            matrixfree_result.basis
+        else
+            convert_start = time_ns()
+            reduced_eqs = dense_matrix(op)
+            convert_time = _profile_seconds(convert_start)
+            try
+                _nullspace!(reduced_eqs; atol = TOL_NULLSPACE)
+            catch err
+                err isa LAPACKException || rethrow(err)
+                @warn "LAPACK SDD failed, retrying with SVD" exception = err
+                reduced_eqs = dense_matrix(op)
+                _nullspace!(reduced_eqs; atol = TOL_NULLSPACE, alg = LinearAlgebra.QRIteration())
+            end
+        end
+        nullspace_time = _profile_seconds(nullspace_start)
+
+        N123 = size(solutions, 2)
+        matrixfree_residual = isnothing(matrixfree_result) ? missing : matrixfree_result.residual
+        matrixfree_ortherr = isnothing(matrixfree_result) ? missing : matrixfree_result.ortherr
+        matrixfree_sigmas = isnothing(matrixfree_result) ? missing : matrixfree_result.sigmas
+        matrixfree_discarded_sigmas = isnothing(matrixfree_result) ? missing : matrixfree_result.discarded_sigmas
+        matrixfree_eigenvalues = isnothing(matrixfree_result) ? missing : matrixfree_result.eigenvalues
+        matrixfree_discarded_eigenvalues = isnothing(matrixfree_result) ? missing : matrixfree_result.discarded_eigenvalues
+        operator_storage_bytes = highest_weight_operator_storage_bytes(op)
+        if use_matrixfree
+            kept_sigma_max = isempty(matrixfree_sigmas) ? missing : maximum(matrixfree_sigmas)
+            discarded_sigma_min = isempty(matrixfree_discarded_sigmas) ? missing : minimum(matrixfree_discarded_sigmas)
+            @warn "CGC matrix-free: $(dimname(s1)) x $(dimname(s2)) -> $(dimname(s3)); dense_est=$(round(_dense_memory_gib(T, M, K); digits = 3)) GiB; op_est=$(operator_storage_bytes) bytes; time=$(round(matrixfree_time; digits = 3)) s; residual=$(matrixfree_residual); ortherr=$(matrixfree_ortherr); kept_sigma_max=$(kept_sigma_max); discarded_sigma_min=$(discarded_sigma_min)"
+        end
+        if should_log
+            @info "highest_weight_CGC solved" s1 s2 s3 N T M K method nullity = N123 slice_time convert_time nullspace_time total_time = _profile_seconds(build_start) operator_storage_bytes matrixfree_time matrixfree_residual matrixfree_ortherr matrixfree_sigmas matrixfree_discarded_sigmas matrixfree_eigenvalues matrixfree_discarded_eigenvalues
+        end
+        _profile_record_current_cgc(
+            :highest_weight_CGC_solved, s1, s2, s3;
+            N, T, M, K, method, nullity = N123, slice_time, convert_time,
+            nullspace_time, total_time = _profile_seconds(build_start),
+            operator_storage_bytes, matrixfree_time,
+            matrixfree_residual, matrixfree_ortherr, matrixfree_sigmas,
+            matrixfree_discarded_sigmas, matrixfree_eigenvalues,
+            matrixfree_discarded_eigenvalues
+        )
+
+        @assert N123 == directproduct(s1, s2)[s3]
+
+        solutions = gaugefix!(solutions)
+
+        CGC = SparseArray{T}(undef, d1, d2, d3, N123)
+        for α in 1:N123
+            for (i, m1m2) in enumerate(op.cols)
+                CGC[m1m2, d3, α] = solutions[i, α]
+            end
+        end
+
+        return CGC
+    end
 
     Jp_list1 = creation(s1)
     Jp_list2 = creation(s2)
@@ -398,6 +517,13 @@ function dense_matrix(op::HighestWeightOperator{T}) where {T}
     return A
 end
 
+function highest_weight_operator_storage_bytes(op::HighestWeightOperator)
+    return sizeof(eltype(op.val)) * length(op.val) +
+           sizeof(Int) * (length(op.src) + length(op.dst)) +
+           sizeof(CartesianIndex{2}) * length(op.cols) +
+           sizeof(CartesianIndex{3}) * length(op.rows)
+end
+
 function highest_weight_nullspace_dense_uncached(T::Type{<:Real}, s1::I, s2::I, s3::I) where {I <: SUNIrrep}
     op = highest_weight_operator(T, s1, s2, s3)
     A = dense_matrix(op)
@@ -432,6 +558,17 @@ function highest_weight_nullspace_matrixfree_uncached(
         restarts::Int = 1
     ) where {I <: SUNIrrep}
     op = highest_weight_operator(T, s1, s2, s3)
+    return _highest_weight_nullspace_matrixfree(T, op; tol, maxiter, krylovdim, restarts)
+end
+
+function _highest_weight_nullspace_matrixfree(
+        T::Type{<:Real}, op::HighestWeightOperator;
+        tol::Real = 1.0e-10,
+        maxiter::Int = 300,
+        krylovdim::Int = 50,
+        restarts::Int = 1
+    )
+    s1, s2, s3 = op.s1, op.s2, op.s3
     r = directproduct(s1, s2)[s3]
     r > 0 || throw(ArgumentError("channel $s1 x $s2 -> $s3 has zero multiplicity"))
     restarts >= 1 || throw(ArgumentError("restarts must be positive"))
