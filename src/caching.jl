@@ -16,7 +16,7 @@ function _cgc_cache_path()
     return mkpath(path)
 end
 
-const CGC_CACHE_PATH = _cgc_cache_path()
+CGC_CACHE_PATH = _cgc_cache_path()
 function cgc_cachepath(s1::SUNIrrep{N}, s2::SUNIrrep{N}, T = Float64) where {N}
     return joinpath(CGC_CACHE_PATH, string(N), string(T), _key(s1), _key(s2))
 end

@@ -21,4 +21,9 @@ include("clebschgordan.jl")
 include("sector.jl")
 include("naming.jl")
 
+function __init__()
+    global CGC_CACHE_PATH = _cgc_cache_path()
+    return nothing
+end
+
 end
