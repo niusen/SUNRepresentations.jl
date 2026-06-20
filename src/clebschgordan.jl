@@ -410,7 +410,7 @@ function highest_weight_nullspace_matrixfree_uncached(
     Q = _orthonormalize_columns(reduce(hcat, vecs))
     AQ = mul_A(op, Q)
     residual = norm(AQ) / max(norm(Q), eps(float(one(T))))
-    ortherr = norm(Q' * Q - Matrix{T}(I, size(Q, 2), size(Q, 2)))
+    ortherr = norm(Q' * Q - Matrix{T}(LinearAlgebra.I, size(Q, 2), size(Q, 2)))
 
     return (;
         basis = Q,
