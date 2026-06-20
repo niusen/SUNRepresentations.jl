@@ -257,6 +257,175 @@ function highest_weight_CGC(T::Type{<:Real}, s1::I, s2::I, s3::I) where {I <: SU
     return CGC
 end
 
+struct HighestWeightOperator{T, I <: SUNIrrep}
+    s1::I
+    s2::I
+    s3::I
+    cols::Vector{CartesianIndex{2}}
+    rows::Vector{CartesianIndex{3}}
+    row_index::Dict{CartesianIndex{3}, Int}
+    src::Vector{Int}
+    dst::Vector{Int}
+    val::Vector{T}
+    M::Int
+    K::Int
+end
+
+function highest_weight_operator(T::Type{<:Real}, s1::I, s2::I, s3::I) where {I <: SUNIrrep}
+    d1, d2 = dim(s1), dim(s2)
+    N = s1.N
+
+    Jp_list1 = creation(s1)
+    Jp_list2 = creation(s2)
+
+    cols = Vector{CartesianIndex{2}}()
+    row_keys = Vector{CartesianIndex{3}}()
+    edge_rows = Vector{CartesianIndex{3}}()
+    edge_src = Int[]
+    edge_val = T[]
+
+    map2 = weightmap(basis(s2))
+    w3 = weight(highest_weight(s3))
+    wshift = div(sum(weight(s1)) + sum(weight(s2)) - sum(weight(s3)), N)
+
+    for (m1, pat1) in enumerate(basis(s1))
+        w1 = weight(pat1)
+        w2 = w3 .- w1 .+ wshift
+        for m2 in get(map2, w2, _emptyindexlist)
+            push!(cols, CartesianIndex(m1, m2))
+            col_index = length(cols)
+            for (l, (Jp1, Jp2)) in enumerate(zip(Jp_list1, Jp_list2))
+                for (m1p, v) in nonzero_pairs(Jp1[:, m1])
+                    row = CartesianIndex(l, m1p, m2)
+                    push!(row_keys, row)
+                    push!(edge_rows, row)
+                    push!(edge_src, col_index)
+                    push!(edge_val, convert(T, v))
+                end
+                for (m2p, v) in nonzero_pairs(Jp2[:, m2])
+                    row = CartesianIndex(l, m1, m2p)
+                    push!(row_keys, row)
+                    push!(edge_rows, row)
+                    push!(edge_src, col_index)
+                    push!(edge_val, convert(T, v))
+                end
+            end
+        end
+    end
+
+    rows = unique!(sort!(row_keys))
+    row_index = Dict(row => i for (i, row) in enumerate(rows))
+    edge_dst = Vector{Int}(undef, length(edge_rows))
+    @inbounds for i in eachindex(edge_rows)
+        edge_dst[i] = row_index[edge_rows[i]]
+    end
+
+    return HighestWeightOperator{T, I}(
+        s1, s2, s3, cols, rows, row_index, edge_src, edge_dst, edge_val,
+        length(rows), length(cols)
+    )
+end
+
+function mul_A!(y::AbstractVector, op::HighestWeightOperator, x::AbstractVector)
+    length(y) == op.M || throw(DimensionMismatch("length(y) must be $(op.M)"))
+    length(x) == op.K || throw(DimensionMismatch("length(x) must be $(op.K)"))
+    fill!(y, zero(eltype(y)))
+    @inbounds for e in eachindex(op.val)
+        y[op.dst[e]] += op.val[e] * x[op.src[e]]
+    end
+    return y
+end
+
+function mul_At!(z::AbstractVector, op::HighestWeightOperator, y::AbstractVector)
+    length(z) == op.K || throw(DimensionMismatch("length(z) must be $(op.K)"))
+    length(y) == op.M || throw(DimensionMismatch("length(y) must be $(op.M)"))
+    fill!(z, zero(eltype(z)))
+    @inbounds for e in eachindex(op.val)
+        z[op.src[e]] += conj(op.val[e]) * y[op.dst[e]]
+    end
+    return z
+end
+
+function mul_AtA!(z::AbstractVector, op::HighestWeightOperator, x::AbstractVector)
+    y = Vector{eltype(z)}(undef, op.M)
+    mul_A!(y, op, x)
+    mul_At!(z, op, y)
+    return z
+end
+
+function mul_A(op::HighestWeightOperator, x::AbstractVector)
+    y = zeros(promote_type(eltype(op.val), eltype(x)), op.M)
+    return mul_A!(y, op, x)
+end
+
+function mul_AtA(op::HighestWeightOperator, x::AbstractVector)
+    z = zeros(promote_type(eltype(op.val), eltype(x)), op.K)
+    return mul_AtA!(z, op, x)
+end
+
+function mul_A(op::HighestWeightOperator, X::AbstractMatrix)
+    Y = zeros(promote_type(eltype(op.val), eltype(X)), op.M, size(X, 2))
+    for j in axes(X, 2)
+        mul_A!(view(Y, :, j), op, view(X, :, j))
+    end
+    return Y
+end
+
+function dense_matrix(op::HighestWeightOperator{T}) where {T}
+    A = zeros(T, op.M, op.K)
+    @inbounds for e in eachindex(op.val)
+        A[op.dst[e], op.src[e]] += op.val[e]
+    end
+    return A
+end
+
+function highest_weight_nullspace_dense_uncached(T::Type{<:Real}, s1::I, s2::I, s3::I) where {I <: SUNIrrep}
+    op = highest_weight_operator(T, s1, s2, s3)
+    A = dense_matrix(op)
+    Z = _nullspace!(A; atol = TOL_NULLSPACE)
+    return (; basis = Z, op)
+end
+
+function _orthonormalize_columns(X::AbstractMatrix)
+    F = qr(X)
+    return Matrix(F.Q)[:, 1:size(X, 2)]
+end
+
+function highest_weight_nullspace_matrixfree_uncached(
+        T::Type{<:Real}, s1::I, s2::I, s3::I;
+        tol::Real = 1.0e-10,
+        maxiter::Int = 300,
+        krylovdim::Int = 50
+    ) where {I <: SUNIrrep}
+    op = highest_weight_operator(T, s1, s2, s3)
+    r = directproduct(s1, s2)[s3]
+    r > 0 || throw(ArgumentError("channel $s1 x $s2 -> $s3 has zero multiplicity"))
+
+    x0 = randn(T, op.K)
+    vals, vecs, info = KrylovKit.eigsolve(
+        x -> mul_AtA(op, x), x0, r, :SR;
+        tol = tol, maxiter = maxiter, krylovdim = max(krylovdim, 2r + 10)
+    )
+
+    Q = _orthonormalize_columns(reduce(hcat, vecs))
+    AQ = mul_A(op, Q)
+    residual = norm(AQ) / max(norm(Q), eps(float(one(T))))
+    ortherr = norm(Q' * Q - Matrix{T}(I, size(Q, 2), size(Q, 2)))
+
+    return (;
+        basis = Q,
+        op,
+        eigenvalues = vals,
+        info,
+        residual,
+        ortherr,
+        dense_memory_gib = _dense_memory_gib(T, op.M, op.K),
+        M = op.M,
+        K = op.K,
+        multiplicity = r,
+    )
+end
+
 function lower_weight_CGC!(CGC, s1::I, s2::I, s3::I) where {I <: SUNIrrep{N}} where {N}
     N123 = size(CGC, 4)
     T = eltype(CGC)

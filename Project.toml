@@ -5,6 +5,7 @@ authors = ["Maarten Van Damme <Maarten.VanDamme@UGent.be>, Jutho Haegeman <jutho
 
 [deps]
 JLD2 = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
+KrylovKit = "0b1a1467-8014-51b9-945f-bf0ae24f4b77"
 LRUCache = "8ac3fa9e-de4c-5943-b1dc-09c6b5f20637"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 Pidfile = "fa939f87-e72e-5be4-a000-7fc836dbe307"
@@ -25,6 +26,7 @@ SUNRepresentationsLatexifyExt = "Latexify"
 Aqua = "0.8"
 Combinatorics = "1"
 JLD2 = "0.5, 0.6"
+KrylovKit = "0.4 - 0.9"
 LRUCache = "1.6"
 Latexify = "0.16"
 LinearAlgebra = "1"

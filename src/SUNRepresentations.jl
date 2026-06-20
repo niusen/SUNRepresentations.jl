@@ -8,6 +8,7 @@ using TensorKitSectors
 using LRUCache
 using Scratch, Preferences
 using JLD2, Pidfile
+using KrylovKit
 
 export SUNIrrep, basis, Zweight, creation, annihilation, highest_weight, dim
 export weight, dynkin_label, congruency, casimir, rank
