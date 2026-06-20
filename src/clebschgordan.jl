@@ -94,6 +94,30 @@ function _profile_record_current_cgc(stage, s1, s2, s3; kwargs...)
     return nothing
 end
 
+function _write_matrixfree_current_cgc(stage, s1, s2, s3; kwargs...)
+    path = get(ENV, "SUNREP_CURRENT_CGC_FILE", "")
+    isempty(path) && return nothing
+
+    try
+        open(path, "w") do io
+            println(io, "stage = ", stage)
+            println(io, "s1 = ", repr(s1))
+            println(io, "s2 = ", repr(s2))
+            println(io, "s3 = ", repr(s3))
+            println(io, "SUNREP_BENCH_S1 = ", dimname(s1))
+            println(io, "SUNREP_BENCH_S2 = ", dimname(s2))
+            println(io, "SUNREP_BENCH_S3 = ", dimname(s3))
+            for (key, value) in kwargs
+                println(io, key, " = ", value)
+            end
+            println(io, "time = ", time())
+        end
+    catch err
+        @debug "Could not write matrix-free current CGC file" exception = err path
+    end
+    return nothing
+end
+
 function weightmap(basis)
     N = first(basis).N
     # basis could be a GTPatternIterator{N}, but also a Vector{GTPattern{N}}
@@ -235,8 +259,15 @@ function highest_weight_CGC(T::Type{<:Real}, s1::I, s2::I, s3::I) where {I <: SU
         nullspace_start = time_ns()
         matrixfree_result = nothing
         matrixfree_time = missing
+        operator_storage_bytes = highest_weight_operator_storage_bytes(op)
         solutions = if use_matrixfree
             opts = _cgc_matrixfree_options()
+            _write_matrixfree_current_cgc(
+                :CGC_matrixfree_started, s1, s2, s3;
+                N, T, M, K, matrixfree_mode,
+                dense_memory_gib = _dense_memory_gib(T, M, K),
+                matrixfree_operator_storage_bytes = operator_storage_bytes,
+            )
             matrixfree_result_ref = Ref{Any}()
             matrixfree_time = @elapsed begin
                 matrixfree_result_ref[] = _highest_weight_nullspace_matrixfree(
@@ -271,11 +302,21 @@ function highest_weight_CGC(T::Type{<:Real}, s1::I, s2::I, s3::I) where {I <: SU
         matrixfree_discarded_sigmas = isnothing(matrixfree_result) ? missing : matrixfree_result.discarded_sigmas
         matrixfree_eigenvalues = isnothing(matrixfree_result) ? missing : matrixfree_result.eigenvalues
         matrixfree_discarded_eigenvalues = isnothing(matrixfree_result) ? missing : matrixfree_result.discarded_eigenvalues
-        operator_storage_bytes = highest_weight_operator_storage_bytes(op)
         if use_matrixfree
             kept_sigma_max = isempty(matrixfree_sigmas) ? missing : maximum(matrixfree_sigmas)
             discarded_sigma_min = isempty(matrixfree_discarded_sigmas) ? missing : minimum(matrixfree_discarded_sigmas)
             @warn "CGC matrix-free: $(dimname(s1)) x $(dimname(s2)) -> $(dimname(s3)); dense_est=$(round(_dense_memory_gib(T, M, K); digits = 3)) GiB; op_est=$(operator_storage_bytes) bytes; time=$(round(matrixfree_time; digits = 3)) s; residual=$(matrixfree_residual); ortherr=$(matrixfree_ortherr); kept_sigma_max=$(kept_sigma_max); discarded_sigma_min=$(discarded_sigma_min)"
+            _write_matrixfree_current_cgc(
+                :CGC_matrixfree_finished, s1, s2, s3;
+                N, T, M, K, matrixfree_mode,
+                dense_memory_gib = _dense_memory_gib(T, M, K),
+                matrixfree_operator_storage_bytes = operator_storage_bytes,
+                matrixfree_time,
+                matrixfree_residual,
+                matrixfree_ortherr,
+                kept_sigma_max,
+                discarded_sigma_min,
+            )
         end
         if should_log
             @info "highest_weight_CGC solved" s1 s2 s3 N T M K method nullity = N123 slice_time convert_time nullspace_time total_time = _profile_seconds(build_start) operator_storage_bytes matrixfree_time matrixfree_residual matrixfree_ortherr matrixfree_sigmas matrixfree_discarded_sigmas matrixfree_eigenvalues matrixfree_discarded_eigenvalues
