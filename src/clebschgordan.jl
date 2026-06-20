@@ -40,6 +40,31 @@ function _profile_cgc_large_lowering(::Type{T}, imax, jmax, qr_time) where {T}
     return dense_mb >= 100 || Float64(imax) * Float64(jmax) >= threshold || qr_time >= 1.0
 end
 
+function _profile_record_current_cgc(stage, s1, s2, s3; kwargs...)
+    !_profile_cgc_enabled() && return nothing
+
+    @info "CGC current channel" stage s1 s2 s3 extra = collect(kwargs)
+
+    path = get(ENV, "SUNREP_CURRENT_CGC_FILE", "")
+    isempty(path) && return nothing
+
+    try
+        open(path, "w") do io
+            println(io, "stage = ", stage)
+            println(io, "s1 = ", repr(s1))
+            println(io, "s2 = ", repr(s2))
+            println(io, "s3 = ", repr(s3))
+            for (key, value) in kwargs
+                println(io, key, " = ", value)
+            end
+            println(io, "time = ", time())
+        end
+    catch err
+        @debug "Could not write current CGC profile file" exception = err path
+    end
+    return nothing
+end
+
 function weightmap(basis)
     N = first(basis).N
     # basis could be a GTPatternIterator{N}, but also a Vector{GTPattern{N}}
@@ -136,6 +161,7 @@ function highest_weight_CGC(T::Type{<:Real}, s1::I, s2::I, s3::I) where {I <: SU
     build_start = time_ns()
     d1, d2, d3 = dim(s1), dim(s2), dim(s3)
     N = s1.N
+    _profile_record_current_cgc(:highest_weight_CGC_started, s1, s2, s3; N, T, d1, d2, d3)
 
     Jp_list1 = creation(s1)
     Jp_list2 = creation(s2)
@@ -175,6 +201,12 @@ function highest_weight_CGC(T::Type{<:Real}, s1::I, s2::I, s3::I) where {I <: SU
     if should_log
         @info "highest_weight_CGC equation" s1 s2 s3 N T d1 d2 d3 M K dense_memory_gib = _dense_memory_gib(T, M, K) build_time
     end
+    _profile_record_current_cgc(
+        :highest_weight_CGC_equation_built, s1, s2, s3;
+        N, T, d1, d2, d3, M, K,
+        dense_memory_gib = _dense_memory_gib(T, M, K),
+        build_time
+    )
 
     slice_start = time_ns()
     sliced_eqs = eqs[rows, cols]
@@ -201,6 +233,11 @@ function highest_weight_CGC(T::Type{<:Real}, s1::I, s2::I, s3::I) where {I <: SU
     if should_log
         @info "highest_weight_CGC solved" s1 s2 s3 N T M K nullity = N123 slice_time convert_time nullspace_time total_time = _profile_seconds(build_start)
     end
+    _profile_record_current_cgc(
+        :highest_weight_CGC_solved, s1, s2, s3;
+        N, T, M, K, nullity = N123, slice_time, convert_time,
+        nullspace_time, total_time = _profile_seconds(build_start)
+    )
 
     @assert N123 == directproduct(s1, s2)[s3]
 

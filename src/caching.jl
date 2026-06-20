@@ -72,6 +72,7 @@ function generate_CGC(
         s3::SUNIrrep{N}
     ) where {T, N}
     @debug "Generating CGCs: $s1 ⊗ $s2"
+    _profile_record_current_cgc(:generate_CGC_started, s1, s2, s3; N, T)
     compute_start = time_ns()
     CGCs = _CGC(T, s1, s2, s3)
     compute_time = _profile_seconds(compute_start)
@@ -91,6 +92,7 @@ function generate_CGC(
     end
     _profile_cgc_enabled() &&
         @info "CGC generated" s1 s2 s3 N T compute_time write_time = _profile_seconds(write_start) wrote_cache
+    _profile_record_current_cgc(:generate_CGC_finished, s1, s2, s3; N, T, compute_time)
     return CGCs
 end
 
