@@ -111,6 +111,7 @@ function _write_matrixfree_current_cgc(stage, s1, s2, s3; kwargs...)
                 println(io, key, " = ", value)
             end
             println(io, "time = ", time())
+            flush(io)
         end
     catch err
         @debug "Could not write matrix-free current CGC file" exception = err path
@@ -306,6 +307,7 @@ function highest_weight_CGC(T::Type{<:Real}, s1::I, s2::I, s3::I) where {I <: SU
             kept_sigma_max = isempty(matrixfree_sigmas) ? missing : maximum(matrixfree_sigmas)
             discarded_sigma_min = isempty(matrixfree_discarded_sigmas) ? missing : minimum(matrixfree_discarded_sigmas)
             @warn "CGC matrix-free: $(dimname(s1)) x $(dimname(s2)) -> $(dimname(s3)); dense_est=$(round(_dense_memory_gib(T, M, K); digits = 3)) GiB; op_est=$(operator_storage_bytes) bytes; time=$(round(matrixfree_time; digits = 3)) s; residual=$(matrixfree_residual); ortherr=$(matrixfree_ortherr); kept_sigma_max=$(kept_sigma_max); discarded_sigma_min=$(discarded_sigma_min)"
+            flush(stderr)
             _write_matrixfree_current_cgc(
                 :CGC_matrixfree_finished, s1, s2, s3;
                 N, T, M, K, matrixfree_mode,
