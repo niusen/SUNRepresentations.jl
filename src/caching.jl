@@ -11,7 +11,7 @@ _key(s::SUNIrrep) = string(weight(s))
 function _cgc_cache_path()
     path = get(ENV, "SUNREP_CGC_CACHE_DIR", get(ENV, "SUNREP_TEST_CACHE_DIR", ""))
     if isempty(path)
-        return mktempdir(; prefix = "sunrep_cgc_cache_")
+        return @get_scratch!("CGC")
     end
     return mkpath(path)
 end
