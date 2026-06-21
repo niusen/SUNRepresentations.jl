@@ -26,6 +26,9 @@ _profile_seconds(t0::UInt64) = 1.0e-9 * (time_ns() - t0)
 _dense_memory_gib(::Type{T}, m, n) where {T} = sizeof(T) * Float64(m) * Float64(n) / 1024.0^3
 _dense_memory_mib(::Type{T}, m, n) where {T} = sizeof(T) * Float64(m) * Float64(n) / 1024.0^2
 _eigenvalue_sigma(value) = sqrt(abs(value))
+_profile_round(x) = x isa Real ? round(x; digits = 3) : x
+
+const _MATRIXFREE_CGC_STATS_KEY = :SUNRepresentations_last_matrixfree_cgc_stats
 
 function _cgc_matrixfree_mode()
     value = lowercase(get(ENV, "SUNREP_CGC_MATRIXFREE", "off"))
@@ -119,6 +122,24 @@ function _write_matrixfree_current_cgc(stage, s1, s2, s3; kwargs...)
     return nothing
 end
 
+_set_last_matrixfree_cgc_stats(stats) = task_local_storage(_MATRIXFREE_CGC_STATS_KEY, stats)
+
+function _last_matrixfree_cgc_stats(s1, s2, s3)
+    stats = try
+        task_local_storage(_MATRIXFREE_CGC_STATS_KEY)
+    catch
+        nothing
+    end
+    isnothing(stats) && return nothing
+    stats.s1 == s1 && stats.s2 == s2 && stats.s3 == s3 || return nothing
+    return stats
+end
+
+function _warn_matrixfree_cgc_summary(stats; highest_weight_time, lowering_time, purge_time, total_time, nnz)
+    @warn "CGC matrix-free: $(dimname(stats.s1)) x $(dimname(stats.s2)) -> $(dimname(stats.s3)); dense_est=$(_profile_round(stats.dense_memory_gib)) GiB; op_est=$(stats.operator_storage_bytes) bytes; nullspace_time=$(_profile_round(stats.matrixfree_time)) s; highest_weight_time=$(_profile_round(highest_weight_time)) s; lowering_time=$(_profile_round(lowering_time)) s; purge_time=$(_profile_round(purge_time)) s; total_time=$(_profile_round(total_time)) s; residual=$(stats.matrixfree_residual); ortherr=$(stats.matrixfree_ortherr); kept_sigma_max=$(stats.kept_sigma_max); discarded_sigma_min=$(stats.discarded_sigma_min); nnz=$(nnz)"
+    flush(stderr)
+end
+
 function weightmap(basis)
     N = first(basis).N
     # basis could be a GTPatternIterator{N}, but also a Vector{GTPattern{N}}
@@ -182,6 +203,8 @@ function _CGC(T::Type{<:Real}, s1::I, s2::I, s3::I) where {I <: SUNIrrep}
         @assert s1 == s3
         CGC = trivial_CGC(T, s1, false)
     else
+        cgc_total_start = time_ns()
+        _set_last_matrixfree_cgc_stats(nothing)
         if _profile_cgc_enabled()
             _profile_record_current_cgc(:CGC_highest_weight_started, s1, s2, s3; T)
             hw = @timed highest_weight_CGC(T, s1, s2, s3)
@@ -198,10 +221,77 @@ function _CGC(T::Type{<:Real}, s1::I, s2::I, s3::I) where {I <: SUNIrrep}
             purged = @timed purge!(CGC)
             @info "CGC step finished" step = :purge s1 s2 s3 T time = purged.time allocated_bytes = purged.bytes gc_time = purged.gctime nnz = length(CGC.data)
             _profile_record_current_cgc(:CGC_purge_finished, s1, s2, s3; T, time = purged.time, allocated_bytes = purged.bytes, gc_time = purged.gctime, nnz = length(CGC.data))
+
+            stats = _last_matrixfree_cgc_stats(s1, s2, s3)
+            if !isnothing(stats)
+                _warn_matrixfree_cgc_summary(
+                    stats;
+                    highest_weight_time = hw.time,
+                    lowering_time = lowering.time,
+                    purge_time = purged.time,
+                    total_time = _profile_seconds(cgc_total_start),
+                    nnz = length(CGC.data),
+                )
+            end
         else
+            hw_start = time_ns()
             CGC = highest_weight_CGC(T, s1, s2, s3)
+            highest_weight_time = _profile_seconds(hw_start)
+            stats = _last_matrixfree_cgc_stats(s1, s2, s3)
+            if !isnothing(stats)
+                _write_matrixfree_current_cgc(
+                    :CGC_lowering_started, s1, s2, s3;
+                    N = stats.N, T, M = stats.M, K = stats.K,
+                    matrixfree_mode = stats.matrixfree_mode,
+                    dense_memory_gib = stats.dense_memory_gib,
+                    matrixfree_operator_storage_bytes = stats.operator_storage_bytes,
+                )
+            end
+            lowering_start = time_ns()
             lower_weight_CGC!(CGC, s1, s2, s3)
+            lowering_time = _profile_seconds(lowering_start)
+            if !isnothing(stats)
+                _write_matrixfree_current_cgc(
+                    :CGC_lowering_finished, s1, s2, s3;
+                    N = stats.N, T, M = stats.M, K = stats.K,
+                    matrixfree_mode = stats.matrixfree_mode,
+                    dense_memory_gib = stats.dense_memory_gib,
+                    matrixfree_operator_storage_bytes = stats.operator_storage_bytes,
+                    lowering_time,
+                )
+            end
+            purge_start = time_ns()
+            if !isnothing(stats)
+                _write_matrixfree_current_cgc(
+                    :CGC_purge_started, s1, s2, s3;
+                    N = stats.N, T, M = stats.M, K = stats.K,
+                    matrixfree_mode = stats.matrixfree_mode,
+                    dense_memory_gib = stats.dense_memory_gib,
+                    matrixfree_operator_storage_bytes = stats.operator_storage_bytes,
+                    lowering_time,
+                )
+            end
             purge!(CGC)
+            purge_time = _profile_seconds(purge_start)
+            if !isnothing(stats)
+                _write_matrixfree_current_cgc(
+                    :CGC_purge_finished, s1, s2, s3;
+                    N = stats.N, T, M = stats.M, K = stats.K,
+                    matrixfree_mode = stats.matrixfree_mode,
+                    dense_memory_gib = stats.dense_memory_gib,
+                    matrixfree_operator_storage_bytes = stats.operator_storage_bytes,
+                    lowering_time,
+                    purge_time,
+                )
+                _warn_matrixfree_cgc_summary(
+                    stats;
+                    highest_weight_time,
+                    lowering_time,
+                    purge_time,
+                    total_time = _profile_seconds(cgc_total_start),
+                    nnz = length(CGC.data),
+                )
+            end
         end
     end
     @debug "Computed CGC: $s1 ⊗ $s2 → $s3"
@@ -270,17 +360,31 @@ function highest_weight_CGC(T::Type{<:Real}, s1::I, s2::I, s3::I) where {I <: SU
                 matrixfree_operator_storage_bytes = operator_storage_bytes,
             )
             matrixfree_result_ref = Ref{Any}()
-            matrixfree_time = @elapsed begin
-                matrixfree_result_ref[] = _highest_weight_nullspace_matrixfree(
-                    T, op;
-                    tol = opts.tol,
-                    maxiter = opts.maxiter,
-                    krylovdim = opts.krylovdim,
-                    restarts = opts.restarts,
+            try
+                matrixfree_time = @elapsed begin
+                    matrixfree_result_ref[] = _highest_weight_nullspace_matrixfree(
+                        T, op;
+                        tol = opts.tol,
+                        maxiter = opts.maxiter,
+                        krylovdim = opts.krylovdim,
+                        restarts = opts.restarts,
+                    )
+                end
+                matrixfree_result = matrixfree_result_ref[]
+                matrixfree_result.basis
+            catch err
+                error_message = sprint(showerror, err)
+                @warn "CGC matrix-free failed" s1 s2 s3 N T M K matrixfree_mode dense_memory_gib = _dense_memory_gib(T, M, K) matrixfree_operator_storage_bytes = operator_storage_bytes error = error_message
+                flush(stderr)
+                _write_matrixfree_current_cgc(
+                    :CGC_matrixfree_failed, s1, s2, s3;
+                    N, T, M, K, matrixfree_mode,
+                    dense_memory_gib = _dense_memory_gib(T, M, K),
+                    matrixfree_operator_storage_bytes = operator_storage_bytes,
+                    error = error_message,
                 )
+                rethrow()
             end
-            matrixfree_result = matrixfree_result_ref[]
-            matrixfree_result.basis
         else
             convert_start = time_ns()
             reduced_eqs = dense_matrix(op)
@@ -306,8 +410,16 @@ function highest_weight_CGC(T::Type{<:Real}, s1::I, s2::I, s3::I) where {I <: SU
         if use_matrixfree
             kept_sigma_max = isempty(matrixfree_sigmas) ? missing : maximum(matrixfree_sigmas)
             discarded_sigma_min = isempty(matrixfree_discarded_sigmas) ? missing : minimum(matrixfree_discarded_sigmas)
-            @warn "CGC matrix-free: $(dimname(s1)) x $(dimname(s2)) -> $(dimname(s3)); dense_est=$(round(_dense_memory_gib(T, M, K); digits = 3)) GiB; op_est=$(operator_storage_bytes) bytes; time=$(round(matrixfree_time; digits = 3)) s; residual=$(matrixfree_residual); ortherr=$(matrixfree_ortherr); kept_sigma_max=$(kept_sigma_max); discarded_sigma_min=$(discarded_sigma_min)"
-            flush(stderr)
+            _set_last_matrixfree_cgc_stats((;
+                s1, s2, s3, N, T, M, K, matrixfree_mode,
+                dense_memory_gib = _dense_memory_gib(T, M, K),
+                operator_storage_bytes,
+                matrixfree_time,
+                matrixfree_residual,
+                matrixfree_ortherr,
+                kept_sigma_max,
+                discarded_sigma_min,
+            ))
             _write_matrixfree_current_cgc(
                 :CGC_matrixfree_finished, s1, s2, s3;
                 N, T, M, K, matrixfree_mode,
@@ -621,7 +733,8 @@ function _highest_weight_nullspace_matrixfree(
         x0 = randn(T, op.K)
         vals, vecs, info = KrylovKit.eigsolve(
             x -> mul_AtA(op, x), x0, r, :SR;
-            tol = tol, maxiter = maxiter, krylovdim = max(krylovdim, 2r + 10)
+            tol = tol, maxiter = maxiter, krylovdim = max(krylovdim, 2r + 10),
+            issymmetric = true, ishermitian = true
         )
 
         X, selected_vals, discarded_vals = _lowest_eigenvectors(vals, vecs, r, T)
